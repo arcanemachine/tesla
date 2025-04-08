@@ -82,10 +82,17 @@ defmodule Tesla.Middleware.JSON do
   def encode(env, opts) do
     with true <- encodable?(env),
          {:ok, body} <- encode_body(env.body, opts) do
-      {:ok,
-       env
-       |> Tesla.put_body(body)
-       |> Tesla.put_headers([{"content-type", encode_content_type(opts)}])}
+      env_has_content_type_header =
+        "content-type" in (env.headers |> Enum.map(fn {k, _v} -> String.downcase(k) end))
+
+      if env_has_content_type_header do
+        {:ok, env |> Tesla.put_body(body)}
+      else
+        {:ok,
+         env
+         |> Tesla.put_body(body)
+         |> Tesla.put_headers([{"content-type", encode_content_type(opts)}])}
+      end
     else
       false -> {:ok, env}
       error -> error
