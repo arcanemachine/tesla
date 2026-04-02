@@ -210,6 +210,100 @@ defmodule Tesla.Middleware.CompressionTest do
     assert env.body == "accept-encoding: gzip, deflate, identity"
   end
 
+  defmodule DecompressResponseStreamClient do
+    use Tesla
+
+    plug Tesla.Middleware.DecompressResponse
+
+    adapter fn env ->
+      {status, headers, body} =
+        case env.url do
+          "/" ->
+            compressed = :zlib.gzip("decompressed gzip stream")
+
+            chunks =
+              compressed
+              |> :binary.bin_to_list()
+              |> Enum.chunk_every(5)
+              |> Enum.map(&:binary.list_to_bin/1)
+
+            {200, [{"content-type", "text/plain"}, {"content-encoding", "gzip"}],
+             Stream.map(chunks, & &1)}
+
+          "/with-unsupported" ->
+            compressed = :zlib.gzip("decompressed gzip stream")
+
+            chunks =
+              compressed
+              |> :binary.bin_to_list()
+              |> Enum.chunk_every(5)
+              |> Enum.map(&:binary.list_to_bin/1)
+
+            {200, [{"content-type", "text/plain"}, {"content-encoding", "zstd, gzip"}],
+             Stream.map(chunks, & &1)}
+
+          "/function-stream" ->
+            compressed = :zlib.gzip("decompressed gzip stream")
+
+            chunks =
+              compressed
+              |> :binary.bin_to_list()
+              |> Enum.chunk_every(5)
+              |> Enum.map(&:binary.list_to_bin/1)
+
+            stream =
+              Stream.resource(
+                fn -> chunks end,
+                fn
+                  [] -> {:halt, []}
+                  [chunk | rest] -> {[chunk], rest}
+                end,
+                fn _ -> :ok end
+              )
+
+            {200, [{"content-type", "text/plain"}, {"content-encoding", "gzip"}], stream}
+
+          "/deflate" ->
+            compressed = :zlib.zip("decompressed deflate stream")
+
+            chunks =
+              compressed
+              |> :binary.bin_to_list()
+              |> Enum.chunk_every(5)
+              |> Enum.map(&:binary.list_to_bin/1)
+
+            {200, [{"content-type", "text/plain"}, {"content-encoding", "deflate"}],
+             Stream.map(chunks, & &1)}
+        end
+
+      {:ok, %{env | status: status, headers: headers, body: body}}
+    end
+  end
+
+  test "decompresses streamed gzip responses" do
+    assert {:ok, env} = DecompressResponseStreamClient.get("/")
+    assert env.headers == [{"content-type", "text/plain"}]
+    assert env.body |> Enum.to_list() |> IO.iodata_to_binary() == "decompressed gzip stream"
+  end
+
+  test "stops decompressing streamed responses on unsupported content-encoding" do
+    assert {:ok, env} = DecompressResponseStreamClient.get("/with-unsupported")
+    assert env.headers == [{"content-type", "text/plain"}, {"content-encoding", "zstd"}]
+    assert env.body |> Enum.to_list() |> IO.iodata_to_binary() == "decompressed gzip stream"
+  end
+
+  test "decompresses function stream gzip responses" do
+    assert {:ok, env} = DecompressResponseStreamClient.get("/function-stream")
+    assert env.headers == [{"content-type", "text/plain"}]
+    assert env.body |> Enum.to_list() |> IO.iodata_to_binary() == "decompressed gzip stream"
+  end
+
+  test "decompresses streamed deflate responses" do
+    assert {:ok, env} = DecompressResponseStreamClient.get("/deflate")
+    assert env.headers == [{"content-type", "text/plain"}]
+    assert env.body |> Enum.to_list() |> IO.iodata_to_binary() == "decompressed deflate stream"
+  end
+
   defmodule CompressRequestHeadersClient do
     use Tesla
 

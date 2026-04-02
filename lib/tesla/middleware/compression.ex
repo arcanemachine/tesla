@@ -4,6 +4,9 @@ defmodule Tesla.Middleware.Compression do
 
   Supports "gzip" and "deflate" encodings using Erlang's built-in `:zlib` module.
 
+  When the response body is a stream (`Stream` or function), decompression is
+  applied lazily on each chunk rather than buffering the entire response.
+
   ## Examples
 
   ```elixir
@@ -74,10 +77,10 @@ defmodule Tesla.Middleware.Compression do
 
   def decompress(env) do
     codecs = compression_algorithms(Tesla.get_header(env, "content-encoding"))
-    {decompressed_body, unknown_codecs} = decompress_body(codecs, env.body)
+    {supported_codecs, unknown_codecs} = split_supported_codecs(codecs)
 
     env
-    |> put_decompressed_body(decompressed_body)
+    |> put_decompressed_body(decompress_body(supported_codecs, env.body))
     |> put_or_delete_content_encoding(unknown_codecs)
   end
 
@@ -89,24 +92,72 @@ defmodule Tesla.Middleware.Compression do
     Tesla.put_header(env, "content-encoding", Enum.join(unknown_codecs, ", "))
   end
 
-  defp decompress_body([gzip | rest], body) when gzip in ["gzip", "x-gzip"] do
-    decompress_body(rest, :zlib.gunzip(body))
+  defp split_supported_codecs(codecs), do: split_supported_codecs(codecs, [])
+
+  defp split_supported_codecs([codec | rest], supported)
+       when codec in ["gzip", "x-gzip", "deflate", "identity"] do
+    split_supported_codecs(rest, [codec | supported])
   end
 
-  defp decompress_body(["deflate" | rest], body) do
-    decompress_body(rest, :zlib.unzip(body))
+  defp split_supported_codecs([codec | rest], supported) do
+    {Enum.reverse(supported), Enum.reverse([codec | rest])}
   end
 
-  defp decompress_body(["identity" | rest], body) do
-    decompress_body(rest, body)
+  defp split_supported_codecs([], supported) do
+    {Enum.reverse(supported), []}
   end
 
-  defp decompress_body([codec | rest], body) do
-    {body, Enum.reverse([codec | rest])}
+  defp decompress_body(codecs, body) do
+    Enum.reduce(codecs, body, &decompress_codec/2)
   end
 
-  defp decompress_body([], body) do
-    {body, []}
+  # When the body is a stream (Stream struct or function) we decompress lazily
+  # so we don't attempt to pass a non-binary to :zlib.gunzip/1, which would crash.
+  # These clauses must come before the binary catch-alls below.
+  defp decompress_codec(codec, %Stream{} = body) when codec in ["gzip", "x-gzip"],
+    do: inflate_stream(body, 31)
+
+  defp decompress_codec("deflate", %Stream{} = body), do: inflate_stream(body, -15)
+
+  defp decompress_codec(codec, body) when codec in ["gzip", "x-gzip"] and is_function(body),
+    do: inflate_stream(body, 31)
+
+  defp decompress_codec("deflate", body) when is_function(body), do: inflate_stream(body, -15)
+
+  defp decompress_codec("identity", body), do: body
+  defp decompress_codec(codec, body) when codec in ["gzip", "x-gzip"], do: :zlib.gunzip(body)
+  defp decompress_codec("deflate", body), do: :zlib.unzip(body)
+
+  defp inflate_stream(body, window_bits) do
+    Stream.transform(
+      body,
+      fn -> zlib_open(window_bits) end,
+      &zlib_inflate/2,
+      &zlib_finish/1,
+      &zlib_close/1
+    )
+  end
+
+  defp zlib_open(window_bits) do
+    z = :zlib.open()
+    :ok = :zlib.inflateInit(z, window_bits)
+    z
+  end
+
+  defp zlib_inflate(chunk, z) do
+    {:zlib.inflate(z, chunk), z}
+  end
+
+  # Flush any remaining buffered data so it is emitted before cleanup.
+  defp zlib_finish(z) do
+    chunks = :zlib.inflate(z, <<>>)
+    :ok = :zlib.inflateEnd(z)
+    {chunks, z}
+  end
+
+  # Always close the zlib resource, even if the stream halts early.
+  defp zlib_close(z) do
+    :zlib.close(z)
   end
 
   defp compression_algorithms(nil) do
