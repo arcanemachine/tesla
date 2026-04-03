@@ -1,0 +1,1 @@
+mix run bench/streaming_decompression_validation.exs
